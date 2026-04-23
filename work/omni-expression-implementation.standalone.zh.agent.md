@@ -109,6 +109,22 @@ user-invocable: true
    - 负责运行时接入、调度和某些 native 执行路径。
    - 只有当证据表明根因在此处时才允许修改。
 
+### Calc 算子生成与回退判定链路
+
+当目标表达式位于 SQL `Calc` 算子中时，必须按下面链路理解“表达式是否真的进入原生”。
+
+1. `java` 模块中的 `PlannerModule` 不会直接读取 `omni-table-planner/target` 下的 JAR，而是从 `flink-tnel-0.1-SNAPSHOT.jar` 内嵌资源 `omni-flink-table-planner.jar` 动态加载 planner 类。
+2. `RexNodeUtil.java` 在 planner 阶段把 `RexNode` 翻译成 Calc operator description 中的 JSON 表达式。若未识别某个表达式或 operator，通常会写入 `exprType = "INVALID"` 或 `operator = "INVALID"`。
+3. `ValidateCalcOPStrategy.java` 会递归校验 Calc description 中的表达式 JSON。若校验失败，Calc 不能原生下推。
+4. `OmniGraphOverride.validateVertexForOmniTask()` 会检查 operator description。只要 description 包含 `INVALID`，或 validate strategy 返回 `false`，当前 `Calc` 以及所在 vertex 都会被判定为 `NOT SUITABLE for OmniTask`。
+5. `StreamConfigPOJO` 和 `OperatorDescriptorHelper` 会把 Calc description 继续序列化到 runtime JSON 中，再交给 `OmniTaskExecutor`。
+6. `OmniTaskExecutor` 根据 task configuration 中的 `useomni` 决定是否创建 `OmniTask`。日志 `useOmniFlag is false` 说明回退已经发生，通常问题仍在 planner/validator/打包链路，而不是先去怀疑 OmniOperatorJIT。
+7. 因此，判断一个表达式是否“生成成功”，不能只看源码是否修改，必须同时确认：
+   - SQL client / planner log 中是否还出现 `The operator XXX is not supported`
+   - Calc description 是否还包含 `INVALID`
+   - TaskExecutor log 中 `useOmniFlag` 是否为 `true`
+   - native 结果是否真正来自 Omni 链路，而不是普通 Flink fallback
+
 ## 四、输入契约
 
 当用户请求你实现某个表达式或函数时，先从用户输入中提取以下信息。
@@ -187,6 +203,9 @@ user-invocable: true
 - planner 是否识别
 - JSON plan 序列化是否正确
 - 校验规则是否正确
+- `flink-tnel` 内嵌的 `omni-flink-table-planner.jar` 是否已包含本次 planner 修改
+- Calc description 是否仍包含 `INVALID`
+- TaskExecutor 日志中的 `useOmniFlag` 是否为 `true`
 - native registry 是否接线
 - 原生函数语义是否正确
 - null 行为是否正确
@@ -372,11 +391,44 @@ cd /opt/buildtools/OmniStream/cpp/build/test && ./tneltest --gtest_filter='YourT
 
 ### OmniAdaptor
 
-只重建被触及的模块：
+优先使用 reactor 统一构建 OmniAdaptor 相关模块：
 
 ```bash
-cd /opt/buildtools/OmniAdaptor/omnistream/omniop-flink-extension/java && mvn package -DskipTests
-cd /opt/buildtools/OmniAdaptor/omnistream/omniop-flink-extension/omni-table-planner && mvn package -DskipTests
+cd /opt/buildtools/OmniAdaptor/omnistream/omniop-flink-extension/omni-flink-bundle && mvn clean package -DskipTests
+```
+
+原因：
+
+- `java/pom.xml` 会在 `prepare-package` 阶段通过 `maven-dependency-plugin` 按 Maven 坐标拷贝 `com.huawei.boostkit.flink:omni-table-planer:${project.version}` 到 `target/classes/omni-flink-table-planner.jar`
+- `PlannerModule` 运行时实际加载的是 `flink-tnel` 内嵌的 `omni-flink-table-planner.jar`
+- 因此，如果只执行 `omni-table-planner mvn package`，但没有通过 reactor 一起打包，或者没有先把 planner 安装到本地 Maven 仓库，`java` 模块仍可能把旧 planner 产物打进新的 `flink-tnel`
+
+如果必须分模块构建，必须严格按以下顺序执行：
+
+```bash
+cd /opt/buildtools/OmniAdaptor/omnistream/omniop-flink-extension/omni-table-planner && mvn install -DskipTests
+cd /opt/buildtools/OmniAdaptor/omnistream/omniop-flink-extension/java && mvn clean package -DskipTests
+```
+
+只有在明确知道不涉及 planner 改动时，才可单独构建 `java` 模块。
+
+不要把下面这种流程当作充分条件：
+
+- 只执行 `omni-table-planner mvn package`
+- 未安装 planner 到本地 Maven 仓库就直接执行 `java mvn package`
+
+构建后至少检查以下产物：
+
+- `omnistream/omniop-flink-extension/omni-table-planner/target/omni-table-planer-0.1-SNAPSHOT.jar`
+- `omnistream/omniop-flink-extension/java/target/flink-tnel-0.1-SNAPSHOT.jar`
+- `omnistream/omniop-flink-extension/java/target/classes/omni-flink-table-planner.jar`
+
+当你修改的是 planner 逻辑时，建议额外做一次内嵌产物校验：
+
+```bash
+cd /opt/buildtools/OmniAdaptor/omnistream/omniop-flink-extension/java
+unzip -p target/flink-tnel-0.1-SNAPSHOT.jar omni-flink-table-planner.jar > /tmp/omni-flink-table-planner.jar
+javap -classpath /tmp/omni-flink-table-planner.jar -c org.apache.flink.table.planner.plan.nodes.exec.util.RexNodeUtil | grep -n '目标 operator 名'
 ```
 
 ### 构建结果校验要求
@@ -388,6 +440,7 @@ cd /opt/buildtools/OmniAdaptor/omnistream/omniop-flink-extension/omni-table-plan
 1. OmniOperatorJIT 的 3 个 `.so` 文件是否已生成到 `$OMNI_HOME/lib`
 2. OmniStream 的 `cpp/build/jni/libtnel.so` 是否已生成
 3. OmniOperatorJIT 与 OmniStream 的构建类型是否匹配
+4. `flink-tnel` 内嵌的 `omni-flink-table-planner.jar` 是否确实带上了本次 planner 变更
 
 如果任何一个检查失败，则必须在报告中明确写出失败项，不得宣称构建成功。
 
@@ -500,6 +553,17 @@ echo "$FLINK_CLASSPATH""$FLINK_DIST"
 
 ### Step 5：执行 SQL 并分别保存两次结果
 
+#### 5.0 SQL 输入准备约束
+
+如果代理需要自行编写用于 native 验证的 SQL，默认不要使用 `VALUES` 作为输入源。
+
+原因：当前环境下 native 链路可能不支持 `VALUES` 语法对应的执行路径，容易把“输入源不兼容”误判成“表达式不支持”。
+
+默认策略：
+
+- 优先使用 `filesystem` + `csv` 或已有物理表作为输入源
+- 只有在已经验证当前环境支持 `VALUES` 时，才使用 `VALUES` 构造测试数据
+
 原生 Flink 与 native 都执行同一条命令：
 
 ```bash
@@ -519,6 +583,28 @@ cat /tmp/flink_output.txt
 
 如果执行前需要避免结果互相覆盖，应该先备份上一次 `/tmp/flink_output.txt`，再进行下一次执行。
 
+#### 5.1 native 结果文件优先判定规则
+
+当前 native 代码的结果会被拦截并输出到 `/tmp/flink_output.txt`，因此在 native 链路执行完成后，控制台可能出现如下报错：
+
+```text
+[ERROR] Could not execute SQL statement. Reason:
+java.io.IOException: Job terminated abnormally, no job execution result can be fetched
+
+Shutting down the session...
+```
+
+上述报错在当前链路下不一定代表任务真实失败，不能仅根据这段返回信息判断 native 执行失败。
+
+当出现该报错时，必须继续执行以下检查：
+
+1. 检查 `/tmp/flink_output.txt` 是否存在
+2. 检查 `/tmp/flink_output.txt` 是否包含预期结果
+3. 检查 Flink 日志中是否存在其他真实异常
+4. 必要时通过 Flink Web API 确认任务是否处于异常结束状态
+
+只有在结果文件缺失、结果内容异常、日志中存在真实错误、或 Web API 显示任务异常失败时，才可判定 native 执行失败。
+
 ### Step 6：结果一致性判定规则
 
 端到端验证的成功标准如下：
@@ -537,6 +623,12 @@ cat /tmp/flink_output.txt
 - 若两边结果内容不一致，即使顺序不同，也必须继续诊断，不得宣称验证通过
 - 只有在“结果内容一致、顺序差异可忽略”的前提下，才能视为端到端验证成功
 
+对于 native 链路，需要补充以下特殊判定：
+
+- 如果 SQL Client 返回了 `Job terminated abnormally, no job execution result can be fetched`，不能直接判定失败
+- 如果 `/tmp/flink_output.txt` 已生成且结果内容正确，同时日志中没有其他真实异常，则该次 native 执行应视为成功
+- 如果 `/tmp/flink_output.txt` 已生成，但日志或 Web API 显示任务存在真实失败，则应继续排查，不能仅凭结果文件直接宣称成功
+
 ### Step 7：失败时的诊断路径
 
 如果原生 Flink 失败，优先确认：
@@ -551,7 +643,67 @@ cat /tmp/flink_output.txt
 1. `config.sh` 是否已切换到 native 模式
 2. native patch JAR 是否已正确加入类路径
 3. OmniAdaptor 构建产物是否为最新
-4. Flink 日志中是否存在表达式翻译、校验、类加载或 native 执行异常
+4. `flink-tnel` 内嵌的 `omni-flink-table-planner.jar` 是否为最新
+5. `/tmp/flink_output.txt` 是否已生成且内容是否正确
+6. Flink 日志中是否存在表达式翻译、校验、类加载或 native 执行异常
+7. 是否可以通过 Flink Web API 确认任务状态正常
+
+如果 native 控制台返回如下错误：
+
+```text
+Job terminated abnormally, no job execution result can be fetched
+```
+
+必须按以下顺序继续判断：
+
+1. 先看 `/tmp/flink_output.txt` 是否存在
+2. 再看结果文件内容是否正确
+3. 再检查 `/usr/local/flink/log/` 下是否有其他真实异常
+4. 必要时调用 Flink Web API 查询任务最终状态
+
+若结果文件存在且内容正确，同时日志和 Web API 没有显示真实失败，则应判定为“任务实际成功，SQL Client 返回信息为假失败表现”。
+
+### Calc 原生回退专用诊断
+
+当日志出现以下任一信号时，说明问题通常还在 OmniAdaptor 的 planner、validator 或打包链路，而不是先去修改 OmniOperatorJIT：
+
+- `RexNodeUtil` 打印 `The operator XXX is not supported`
+- Calc description 中出现 `{"operator":"INVALID"}` 或 `{"exprType":"INVALID"}`
+- `validateVertexChainInfoForOmniTask ... Calc[...] is NOT SUITABLE for OmniTask`
+- `Task name is ... and useOmniFlag is false`
+
+遇到上述信号时，必须按下面顺序排查：
+
+1. 确认 `RexNodeUtil.java` 是否已经加入目标 operator，并正确输出 JSON
+2. 确认 `ValidateCalcOPStrategy.java` 是否已经接受该 JSON 结构
+3. 确认本地 Maven 仓库中的 `omni-table-planer` 已更新
+4. 确认 `flink-tnel` 内嵌的 `omni-flink-table-planner.jar` 已更新，而不是旧包
+5. 重启 Flink 后重新查看最新的 SQL client log 与 TaskExecutor log
+
+若日志已经变为以下信号，则说明 planner/validator/打包链路已通过，下一步再看 OmniTask、OmniStream 或 OmniOperatorJIT：
+
+- Calc description 中目标表达式已展开为合法 JSON，而不是 `INVALID`
+- `Calc[...] is SUITABLE for OmniTask`
+- `useOmniFlag is true`
+
+### flink-tnel 运行时 patch 问题诊断
+
+`flink-tnel` 不仅包含 planner loader，也覆盖了部分 Flink runtime 类，例如 `StreamTask`。因此 native 失败并不总是表达式不支持。
+
+如果 native 模式报错满足以下特征：
+
+- 异常栈落在 `flink-tnel-0.1-SNAPSHOT.jar` 覆盖的 Flink runtime 类中
+- 报错为 `Unresolved compilation problem`、`class ... is not visible here`、`NoSuchMethodError`、`ClassNotFoundException` 等类加载或可见性问题
+
+则应优先按“runtime patch JAR 问题”处理，而不是直接判断为表达式翻译失败。
+
+此类问题修复后，必须重新执行：
+
+```bash
+cd /opt/buildtools/OmniAdaptor/omnistream/omniop-flink-extension/java && mvn clean package -DskipTests
+```
+
+然后重启 Flink，再继续 SQL 验证。
 
 如果两边都成功但结果不一致，必须继续按以下顺序排查：
 
@@ -749,6 +901,8 @@ ls -lt /usr/local/flink/log/
 - [ ] 已评估兼容性影响
 - [ ] 已生成功能验证报告
 - [ ] 已运行 focused UT
+- [ ] 已确认 `flink-tnel` 内嵌 planner JAR 为最新版本
+- [ ] 已检查 SQL client / TaskExecutor 日志中的 `INVALID` 与 `useOmniFlag`
 - [ ] 已完成原生 Flink 与 native 双链路端到端验证，且结果内容一致（顺序可不一致）
 
 ## 十六、执行风格要求
@@ -786,4 +940,3 @@ ls -lt /usr/local/flink/log/
 9. 给出结构化功能验证报告。
 
 如果请求超出“表达式/函数实现与验证”范围，必须明确说明超出范围。
-
