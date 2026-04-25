@@ -830,6 +830,94 @@ ls -lt /usr/local/flink/log/
 /usr/local/flink/bin/stop-cluster.sh
 ```
 
+### Step 10：Kafka Source 场景专项开发与排障要求
+
+当目标 SQL 使用 Kafka 作为 source 时，必须额外执行以下规则。
+
+#### 10.1 先区分“正常常驻”与“异常 teardown”
+
+- Kafka 无界流 task 的正常状态应当是持续 `RUNNING`，而不是因为读到某条记录后自然退出。
+- 单条 `null` 值、字段缺失或单条脏数据，不应被当作 source 完成信号。
+- 如果某条输入后 task 进入 `FAILING`、`FAILED`、进程退出或触发 core dump，默认先按 bug 处理，不要解释为无界流正常结束。
+
+#### 10.2 必须确认 source 真实执行路径
+
+在修改代码前，至少确认以下事实：
+
+1. source connector 是否为 Kafka。
+2. source format 是否为 `json`。
+3. 当前走的是 batch 反序列化路径还是单条反序列化路径。
+4. 具体使用的 deserialization schema 是哪个类。
+
+如果未确认执行路径，就不要直接修改 OmniStream source runtime。
+
+#### 10.3 Kafka source 的证据收集要求
+
+当问题发生在 Kafka source 场景时，必须优先收集以下证据：
+
+1. 失败前后注入的原始 Kafka 消息内容。
+2. SQL client 是否仍在运行，或是否提前退出。
+3. Flink Web UI / Web API 中 job 状态是否仍为 `RUNNING`。
+4. `/usr/local/flink/log/` 下最新的 `taskexecutor` 与 `standalonesession` 日志。
+5. 是否生成新的 core 文件，以及 core 生成时间是否与本次注入一致。
+
+要求：不要只看 SQL client 的控制台输出，也不要只看 `/tmp/flink_output.txt`。
+
+#### 10.4 Kafka 无界流的端到端验证方式
+
+Kafka source 是无界流时，不能等待任务自然结束后再判断结果，必须在线验证。
+
+推荐顺序如下：
+
+1. 启动 Flink 集群。
+2. 启动 SQL client，保持作业运行。
+3. 先记录 job 初始状态、进程状态和 core 文件基线。
+4. 向 Kafka 注入目标消息，包括正常数据、`null` 数据和边界数据。
+5. 在任务持续运行期间，实时检查 job 是否仍为 `RUNNING`。
+6. 对比注入前后的日志、输出结果与 core 文件变化。
+
+判定规则：
+
+- 如果消息注入后 job 保持 `RUNNING`，且没有新 core、没有真实异常日志，则优先判定修复有效。
+- 如果 SQL client 报错，但 job 仍为 `RUNNING` 且日志无真实异常，不能仅凭控制台输出判定失败。
+- 如果消息注入后 job 失败或出现新 core，必须继续做 native 栈或日志定位，不能只说“Kafka 无界流异常退出”。
+
+#### 10.5 Kafka source 场景的根因分层要求
+
+当 Kafka source 出现失败时，必须按以下顺序分层判断：
+
+1. 先看 source 数据本身是否触发了反序列化异常。
+2. 再看异常是否沿 `RecordEmitter`、`SourceReader`、`SourceOperator` 向 task 主循环传播。
+3. 如果 task 因异常进入 cleanup，再检查 source close、fetcher shutdown、thread join、析构路径是否存在二次崩溃。
+4. 不要把 cleanup 阶段的 `std::terminate`、`SIGABRT`、thread joinable 崩溃误判成最初的业务语义错误。
+
+这意味着：source 业务 bug 和 cleanup 生命周期 bug 可能是串联关系，必须分别定位，不能混为一个根因。
+
+#### 10.6 JSON Kafka source 的专项注意事项
+
+如果 Kafka source 使用 `json` format，必须显式检查以下场景：
+
+1. 字段存在但值为 `null`。
+2. 字段缺失。
+3. 字段类型与目标列类型不匹配。
+4. batch 入口与单条入口是否都覆盖了相同语义。
+
+默认要求：
+
+- 对于可空列，`null` 或缺失字段应优先映射为列 null，而不是直接抛异常。
+- 如果 batch 反序列化和单条反序列化共用 schema，必须确认两条入口都被覆盖，不允许只修一条路径。
+
+#### 10.7 Kafka source 场景的测试补充要求
+
+除了表达式/函数本身的 UT，还应补充或验证以下 source 侧测试：
+
+1. 反序列化 schema 对 `null` 字段的处理。
+2. 反序列化 schema 对字段缺失的处理。
+3. source cleanup / close 路径在异常后不会再次触发 abort。
+4. 必要时增加子进程级别测试，验证 `close()`、析构或线程清理不会触发 `std::terminate`。
+
+原则：Kafka source 场景不能只补 planner 或 expression UT；如果问题发生在 source runtime，必须有针对 source runtime 的 regression test。
+
 ## 十一、开发原则
 
 必须遵守以下原则：
